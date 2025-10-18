@@ -1,135 +1,190 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Body, Depends
-from fastapi.responses import FileResponse, JSONResponse
-from app.utils.data_processing import (
-    process_csv, group_by_aggregate, sort_data, compute_correlation,
-    detect_outliers, clean_data, generate_plot, get_descriptive_stats, get_value_counts
-)
-from app.config import limiter  # Import limiter from config
+# app/routes/analytics.py
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Body, Request
+from pydantic import BaseModel, Field
+from typing import List, Optional
 import pandas as pd
 import io
+import hashlib
 import uuid
 import json
 import os
-from typing import List, Optional
+import logging
 
-router = APIRouter(prefix="/analytics", tags=["analytics"])
+from app.config import limiter
+from slowapi.util import get_remote_address
+from slowapi import Limiter
 
-@router.post("/upload", summary="Upload and Analyze File (New: Group By, Sort, Correlation, etc.)")
-@limiter.limit("5/minute")  # Use limiter directly
+from app.utils.data_processing import (
+    process_csv,
+    group_by_aggregate,
+    sort_data,
+    compute_correlation,
+    detect_outliers,
+    clean_data,
+    generate_plot,
+    get_descriptive_stats,
+    get_value_counts,
+)
+
+from app.utils.db import save_analysis_db, get_analysis_db
+
+logger = logging.getLogger("datastream.analytics")
+router = APIRouter(tags=["analytics"])
+
+# Request model for validated parameters
+class AnalysisParams(BaseModel):
+    stats: List[str] = Field(default_factory=lambda: ["mean", "median"])
+    filter_column: Optional[str] = None
+    filter_value: Optional[float] = None
+    group_by: Optional[str] = None
+    sort_by: Optional[str] = None
+    ascending: bool = True
+    clean: bool = False
+    detect_outliers_flag: bool = False
+    correlation: bool = False
+    plot: bool = False
+    descriptive: bool = False
+    value_counts_col: Optional[str] = None
+
+# simple in-memory cache mapping file_hash -> analysis_id
+CACHE: dict = {}
+
+# apply limiter per route using limiter from config
+route_limit = limiter.limit
+
+@router.post("/upload", summary="Upload and analyze a file (CSV/Excel) or JSON body")
+@route_limit("10/minute")
 async def upload_file(
-    request,  # Required for slowapi
+    request: Request,
+    params: AnalysisParams = Depends(),
     file: UploadFile = File(None),
     json_data: Optional[dict] = Body(None),
-    stats: List[str] = Query(["mean", "median"], description="Stats to calculate (mean, median, min, max)"),
-    filter_column: Optional[str] = Query(None, description="Column to filter"),
-    filter_value: Optional[float] = Query(None, description="Value to filter by (e.g., sales > value)"),
-    group_by: Optional[str] = Query(None, description="Column to group by (New Feature 1)"),
-    sort_by: Optional[str] = Query(None, description="Column to sort by (New Feature 2)"),
-    ascending: bool = Query(True, description="Sort ascending? (New Feature 2)"),
-    clean: bool = Query(False, description="Clean data (remove duplicates, fill NaN)? (New Feature 5)"),
-    detect_outliers_flag: bool = Query(False, description="Detect outliers? (New Feature 4)"),
-    correlation: bool = Query(False, description="Compute correlation matrix? (New Feature 3)"),
-    plot: bool = Query(False, description="Generate bar chart plot? (New Feature 6)"),
-    descriptive: bool = Query(False, description="Get descriptive stats? (New Feature 9)"),
-    value_counts_col: Optional[str] = Query(None, description="Column for value counts (New Feature 10)")
 ):
     if not file and not json_data:
-        raise HTTPException(status_code=400, detail="Provide either a file or JSON data")
-    
-    try:
-        if file:
-            if not file.filename.endswith((".csv", ".xlsx", ".xls")):
-                raise HTTPException(status_code=400, detail="Only CSV or Excel files allowed")
-            if file.size > 5 * 1024 * 1024:
-                raise HTTPException(status_code=400, detail="File too large")
-            content = await file.read()
-            if file.filename.endswith(".csv"):
-                df = pd.read_csv(io.StringIO(content.decode("utf-8")))
-            else:
-                df = pd.read_excel(io.BytesIO(content))
-            filename = file.filename
-        else:
-            df = pd.DataFrame(json_data["data"])
-            filename = "json_input"
+        raise HTTPException(status_code=400, detail="Provide either a file upload or JSON data in the request body.")
 
-        if clean:
+    try:
+        # --- load dataframe ---
+        if file:
+            filename = file.filename or "uploaded"
+            content = await file.read()
+            size = len(content)
+            max_size = 8 * 1024 * 1024  # 8 MB
+            if size > max_size:
+                raise HTTPException(status_code=413, detail="File too large (max 8 MB).")
+            lower = filename.lower()
+            if lower.endswith(".csv"):
+                df = pd.read_csv(io.StringIO(content.decode("utf-8", errors="replace")))
+            elif lower.endswith((".xls", ".xlsx")):
+                df = pd.read_excel(io.BytesIO(content))
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported file type. Use CSV or Excel.")
+            file_hash = hashlib.md5(content).hexdigest()
+        else:
+            # accept {"data": [ {..}, {...} ] } or a direct list
+            if isinstance(json_data, dict) and "data" in json_data:
+                df = pd.DataFrame(json_data["data"])
+            elif isinstance(json_data, list):
+                df = pd.DataFrame(json_data)
+            else:
+                raise HTTPException(status_code=400, detail="JSON body must be a list or contain 'data' key with list.")
+            filename = "json_input"
+            file_hash = hashlib.md5(json.dumps(json_data, sort_keys=True).encode()).hexdigest()
+
+        # --- serve cached analysis if present ---
+        if file_hash in CACHE:
+            cached_id = CACHE[file_hash]
+            rec = get_analysis_db(cached_id)
+            if rec:
+                return {"cached": True, "analysis_id": cached_id, "analysis": json.loads(rec["result"])}
+
+        # --- cleaning ---
+        if params.clean:
             df = clean_data(df)
 
-        if filter_column and filter_value is not None:
-            if filter_column not in df.columns:
-                raise HTTPException(status_code=400, detail="Filter column not found")
-            df = df[df[filter_column] > filter_value]
+        # --- filtering ---
+        if params.filter_column and params.filter_value is not None:
+            if params.filter_column not in df.columns:
+                raise HTTPException(status_code=400, detail="Filter column not found.")
+            df = df[df[params.filter_column] > params.filter_value]
 
-        if sort_by:
-            df = sort_data(df, sort_by, ascending)
+        # --- sorting ---
+        if params.sort_by:
+            if params.sort_by not in df.columns:
+                raise HTTPException(status_code=400, detail="Sort column not found.")
+            df = sort_data(df, params.sort_by, params.ascending)
 
-        result = process_csv(df, stats)
+        # --- main analysis ---
+        result = process_csv(df, params.stats)
 
-        if group_by:
-            result["group_by"] = group_by_aggregate(df, group_by, stats)
+        if params.group_by:
+            if params.group_by not in df.columns:
+                raise HTTPException(status_code=400, detail="Group-by column not found.")
+            result["group_by"] = group_by_aggregate(df, params.group_by, params.stats)
 
-        if correlation:
+        if params.correlation:
             result["correlation"] = compute_correlation(df)
 
-        if detect_outliers_flag:
+        if params.detect_outliers_flag:
             result["outliers"] = detect_outliers(df)
 
-        if descriptive:
+        if params.descriptive:
             result["descriptive_stats"] = get_descriptive_stats(df)
 
-        if value_counts_col:
-            result["value_counts"] = get_value_counts(df, value_counts_col)
+        if params.value_counts_col:
+            if params.value_counts_col not in df.columns:
+                raise HTTPException(status_code=400, detail="Value counts column not found.")
+            result["value_counts"] = get_value_counts(df, params.value_counts_col)
 
-        if plot:
-            plot_image = generate_plot(df, stats)
-            result["plot_image_base64"] = plot_image
+        if params.plot:
+            plot_b64 = generate_plot(df, params.stats)
+            result["plot_image_base64"] = plot_b64
 
         analysis_id = str(uuid.uuid4())
-        os.makedirs("storage", exist_ok=True)
-        with open(f"storage/{analysis_id}.json", "w") as f:
-            json.dump(result, f)
-        
+        save_analysis_db(analysis_id, result)
+        CACHE[file_hash] = analysis_id
+
         return {"filename": filename, "analysis_id": analysis_id, "analysis": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing: {str(e)}")
 
-@router.get("/results/{analysis_id}", summary="Retrieve Past Analysis")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Error processing upload")
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(exc)}")
+
+
+@router.get("/results/{analysis_id}", summary="Retrieve saved analysis")
 async def get_analysis(analysis_id: str):
-    try:
-        with open(f"storage/{analysis_id}.json", "r") as f:
-            result = json.load(f)
-        return {"analysis_id": analysis_id, "analysis": result}
-    except FileNotFoundError:
+    rec = get_analysis_db(analysis_id)
+    if not rec:
         raise HTTPException(status_code=404, detail="Analysis not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving: {str(e)}")
+    return {"analysis_id": analysis_id, "analysis": json.loads(rec["result"])}
 
-@router.post("/feedback", summary="Submit Feedback")
-async def submit_feedback(feedback: str = Body(...), rating: int = Body(..., ge=1, le=5)):
-    try:
-        feedback_id = str(uuid.uuid4())
-        feedback_data = {"feedback": feedback, "rating": rating}
-        os.makedirs("storage/feedback", exist_ok=True)
-        with open(f"storage/feedback/{feedback_id}.json", "w") as f:
-            json.dump(feedback_data, f)
-        return {"message": "Thanks for your feedback!", "feedback_id": feedback_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error saving feedback: {str(e)}")
 
-@router.get("/export/{analysis_id}", summary="Export Analysis to CSV (New Feature 8)")
+@router.post("/feedback", summary="Submit feedback")
+@route_limit("20/minute")
+async def submit_feedback(payload: dict = Body(...)):
+    if "feedback" not in payload or "rating" not in payload:
+        raise HTTPException(status_code=400, detail="Provide 'feedback' and 'rating' fields")
+    feedback_id = str(uuid.uuid4())
+    os.makedirs("storage/feedback", exist_ok=True)
+    with open(f"storage/feedback/{feedback_id}.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return {"message": "Feedback received", "feedback_id": feedback_id}
+
+
+@router.get("/export/{analysis_id}", summary="Export saved analysis to CSV")
 async def export_analysis(analysis_id: str):
-    try:
-        with open(f"storage/{analysis_id}.json", "r") as f:
-            result = json.load(f)
-        df_export = pd.DataFrame({"key": list(result.keys()), "value": list(result.values())})
-        export_path = f"storage/{analysis_id}_export.csv"
-        df_export.to_csv(export_path, index=False)
-        return FileResponse(export_path, media_type="text/csv", filename=f"{analysis_id}_analysis.csv")
-    except FileNotFoundError:
+    rec = get_analysis_db(analysis_id)
+    if not rec:
         raise HTTPException(status_code=404, detail="Analysis not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error exporting: {str(e)}")
-
-@router.get("/health", summary="Check API Status")
-async def health_check():
-    return {"status": "API is running - now with 10 new features!"}
+    result = json.loads(rec["result"])
+    # Flatten for export
+    rows = []
+    for k, v in result.items():
+        rows.append({"key": k, "value": json.dumps(v)})
+    df_export = pd.DataFrame(rows)
+    os.makedirs("storage", exist_ok=True)
+    path = f"storage/{analysis_id}_export.csv"
+    df_export.to_csv(path, index=False)
+    return {"download_path": path}

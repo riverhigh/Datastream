@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DataStream Dashboard</title>
+<style>
+    body { font-family: Arial, sans-serif; margin: 40px; }
+    h1 { color: #333; }
+    table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f4f4f4; }
+    button { padding: 5px 10px; cursor: pointer; }
+</style>
+</head>
+<body>
+
+<h1>DataStream Dashboard</h1>
+
+<label>API Key: </label>
+<input type="text" id="apiKey" placeholder="Enter your API key">
+<button onclick="loadRecords()">Load Records</button>
+
+<table id="recordsTable">
+    <thead>
+        <tr>
+            <th>Analysis ID</th>
+            <th>Created At</th>
+            <th>Preview</th>
+            <th>Delete</th>
+        </tr>
+    </thead>
+    <tbody></tbody>
+</table>
+
+<script>
+async function loadRecords() {
+    const apiKey = document.getElementById('apiKey').value;
+    if (!apiKey) { alert("Enter API key"); return; }
+
+    try {
+        const res = await fetch('https://datastream.onrender.com/records', {
+            headers: { 'X-API-Key': apiKey }
+        });
+        if (!res.ok) throw new Error("Failed to load records");
+
+        const data = await res.json();
+        const tbody = document.querySelector('#recordsTable tbody');
+        tbody.innerHTML = '';
+
+        data.records.forEach(record => {
+            const result = JSON.parse(record.result);
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td>${record.id}</td>
+                <td>${record.created_at}</td>
+                <td><pre>${JSON.stringify(result.preview || {}, null, 2)}</pre></td>
+                <td><button onclick="deleteRecord('${record.id}', '${apiKey}')">Delete</button></td>
+            `;
+            tbody.appendChild(tr);
+        });
+    } catch (err) {
+        alert(err.message);
+    }
+}
+
+async function deleteRecord(id, apiKey) {
+    if (!confirm("Delete this analysis?")) return;
+    try {
+        const res = await fetch(`https://datastream.onrender.com/delete/${id}`, {
+            method: 'DELETE',
+            headers: { 'X-API-Key': apiKey }
+        });
+        if (!res.ok) throw new Error("Failed to delete");
+        alert("Deleted successfully");
+        loadRecords();
+    } catch (err) {
+        alert(err.message);
+    }
+}
+</script>
+
+</body>
+</html>

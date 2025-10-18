@@ -1,97 +1,112 @@
+# app/utils/data_processing.py
 import pandas as pd
-import matplotlib.pyplot as plt
+import numpy as np
 import io
 import base64
-from scipy import stats  # For Z-score in outliers
+import matplotlib.pyplot as plt
+from scipy import stats
 
-def process_csv(df: pd.DataFrame, stats: list[str]) -> dict:
-    try:
-        if df.empty:
-            return {"error": "Empty DataFrame provided"}
-        
-        numeric_df = df.select_dtypes(include=["float64", "int64"])
-        if numeric_df.empty:
-            return {"error": "No numeric columns found for analysis"}
-        
-        stat_functions = {
-            "mean": lambda x: x.mean(),
-            "median": lambda x: x.median(),
-            "min": lambda x: x.min(),
-            "max": lambda x: x.max()
-        }
-        
-        result = {
-            "summary": {
-                "row_count": len(df),
-                "numeric_columns": list(numeric_df.columns)
-            },
-            "column_stats": {
-                col: {stat: stat_functions[stat](numeric_df[col]) for stat in stats if stat in stat_functions}
-                for col in numeric_df.columns
-            }
-        }
-        
-        # Text-based chart
-        for col in numeric_df.columns:
-            mean = numeric_df[col].mean()
-            result["column_stats"][col]["text_chart"] = "*" * int(mean // 10)
-        
-        return result
-    except Exception as e:
-        raise Exception(f"Error in data processing: {str(e)}")
+def process_csv(df: pd.DataFrame, stats: list) -> dict:
+    if df is None or df.empty:
+        return {"error": "Empty DataFrame"}
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    result = {"rows": len(df), "columns": df.columns.tolist()}
+    result["columns_stats"] = {}
+    for col in numeric_cols:
+        col_stats = {}
+        series = df[col].dropna()
+        if "mean" in stats:
+            col_stats["mean"] = float(series.mean()) if not series.empty else None
+        if "median" in stats:
+            col_stats["median"] = float(series.median()) if not series.empty else None
+        if "min" in stats:
+            col_stats["min"] = float(series.min()) if not series.empty else None
+        if "max" in stats:
+            col_stats["max"] = float(series.max()) if not series.empty else None
+        if "std" in stats:
+            col_stats["std"] = float(series.std()) if not series.empty else None
+        # small text visualization
+        if not series.empty:
+            mean_val = series.mean()
+            col_stats["text_chart"] = "*" * min(50, int(mean_val // max(1, (abs(mean_val) // 10) or 1)))
+        result["columns_stats"][col] = col_stats
+    return result
 
-# New Feature 1: Group by aggregation
-def group_by_aggregate(df: pd.DataFrame, group_by: str, stats: list[str]) -> dict:
-    if group_by not in df.columns:
-        raise ValueError("Group by column not found")
-    agg_funcs = {stat: stat for stat in stats}  # Simple agg
-    grouped = df.groupby(group_by).agg(agg_funcs)
-    return grouped.to_dict()
+def group_by_aggregate(df: pd.DataFrame, col: str, stats: list) -> dict:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    grouped = df.groupby(col)
+    agg_result = {}
+    for name, group in grouped:
+        agg_result[name] = {}
+        for c in numeric_cols:
+            values = {}
+            if "mean" in stats:
+                values["mean"] = float(group[c].mean()) if not group[c].empty else None
+            if "sum" in stats:
+                values["sum"] = float(group[c].sum()) if not group[c].empty else None
+            if values:
+                agg_result[name][c] = values
+    return agg_result
 
-# New Feature 2: Sort data
-def sort_data(df: pd.DataFrame, sort_by: str, ascending: bool) -> pd.DataFrame:
-    if sort_by not in df.columns:
-        raise ValueError("Sort column not found")
-    return df.sort_values(by=sort_by, ascending=ascending)
+def sort_data(df: pd.DataFrame, by: str, ascending: bool = True) -> pd.DataFrame:
+    return df.sort_values(by=by, ascending=ascending)
 
-# New Feature 3: Compute correlation
 def compute_correlation(df: pd.DataFrame) -> dict:
-    numeric_df = df.select_dtypes(include=["float64", "int64"])
-    if len(numeric_df.columns) < 2:
-        return {"error": "Need at least 2 numeric columns"}
-    return numeric_df.corr().to_dict()
+    numeric = df.select_dtypes(include=[np.number])
+    if numeric.shape[1] < 2:
+        return {}
+    return numeric.corr().fillna(0).to_dict()
 
-# New Feature 4: Detect outliers (using Z-score > 3)
-def detect_outliers(df: pd.DataFrame) -> dict:
-    numeric_df = df.select_dtypes(include=["float64", "int64"])
-    z_scores = stats.zscore(numeric_df)
-    outliers = (abs(z_scores) > 3).any(axis=1)
-    return {"outlier_rows": df[outliers].to_dict(orient="records")}
+def detect_outliers(df: pd.DataFrame, z_thresh: float = 3.0) -> dict:
+    numeric = df.select_dtypes(include=[np.number])
+    if numeric.empty:
+        return {}
+    z = np.abs(stats.zscore(numeric.dropna()))
+    outliers = {}
+    if z.ndim == 1:
+        mask = z > z_thresh
+        outliers[numeric.columns[0]] = numeric[mask].tolist()
+    else:
+        for idx, col in enumerate(numeric.columns):
+            mask = z[:, idx] > z_thresh
+            if mask.any():
+                outliers[col] = numeric[col][mask].tolist()
+    return outliers
 
-# New Feature 5: Clean data
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.drop_duplicates()  # Remove duplicates
-    df = df.fillna(df.mean(numeric_only=True))  # Fill NaN with mean for numeric
+    df = df.copy()
+    df = df.drop_duplicates()
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        median = df[col].median()
+        df[col] = df[col].fillna(median)
     return df
 
-# New Feature 6: Generate plot (bar chart of means)
-def generate_plot(df: pd.DataFrame, stats: list[str]) -> str:
-    numeric_df = df.select_dtypes(include=["float64", "int64"])
-    means = numeric_df.mean()
-    fig, ax = plt.subplots()
-    means.plot(kind="bar", ax=ax)
-    ax.set_title("Mean Values Bar Chart")
-    img_io = io.BytesIO()
-    fig.savefig(img_io, format="png")
-    img_io.seek(0)
-    return base64.b64encode(img_io.read()).decode("utf-8")  # Base64 for response
+def generate_plot(df: pd.DataFrame, stats: list) -> str:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not numeric_cols:
+        return None
+    col = numeric_cols[0]
+    series = df[col].dropna().head(100)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    series.plot(kind="bar", ax=ax)
+    ax.set_title(f"Sample of {col}")
+    ax.set_xlabel("index")
+    ax.set_ylabel(col)
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
 
-# New Feature 9: Descriptive stats
 def get_descriptive_stats(df: pd.DataFrame) -> dict:
-    return df.describe().to_dict()
+    numeric = df.select_dtypes(include=[np.number])
+    if numeric.empty:
+        return {}
+    return numeric.describe().to_dict()
 
-# New Feature 10: Value counts
-def get_value_counts(df: pd.DataFrame, column: str) -> dict:
-    if column not in df.columns:
-        raise ValueError("Column not found for value counts")
-    return df[column].value_counts().to_dict()
+def get_value_counts(df: pd.DataFrame, col: str) -> dict:
+    if col not in df.columns:
+        return {}
+    return df[col].value_counts().to_dict()
